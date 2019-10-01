@@ -3355,7 +3355,7 @@ int __clear_layout_cb(void *user) {
 	if (!__show_status_yesno (core, 0, "Clear all the saved layouts?(y/n): ")) {
 		return 0;
 	}
-	const char *dir_path = __get_panels_config_dir_path ();
+	char *dir_path = __get_panels_config_dir_path ();
 	RList *dir = r_sys_dir (dir_path);
 	if (!dir) {
 		return 0;
@@ -3363,7 +3363,7 @@ int __clear_layout_cb(void *user) {
 	RListIter *it;
 	char *entry;
 	r_list_foreach (dir, it, entry) {
-		const char *tmp = r_str_newf ("%s%s%s", dir_path, R_SYS_DIR, entry);
+		char *tmp = r_str_newf ("%s%s%s", dir_path, R_SYS_DIR, entry);
 		r_file_rm (tmp);
 		free (tmp);
 	}

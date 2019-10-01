@@ -7,7 +7,6 @@
 
 extern int try_walkthrough_jmptbl(RAnal *anal, RAnalFunction *fcn, int depth, ut64 ip, ut64 jmptbl_loc, ut64 jmptbl_off, ut64 sz, int jmptbl_size, ut64 default_case, int ret0);
 extern bool try_get_delta_jmptbl_info(RAnal *anal, RAnalFunction *fcn, ut64 jmp_addr, ut64 lea_addr, ut64 *table_size, ut64 *default_case);
-#define USE_SDB_CACHE 0
 #define READ_AHEAD 1
 #define SDB_KEY_BB "bb.0x%"PFMT64x ".0x%"PFMT64x
 // XXX must be configurable by the user
@@ -44,10 +43,6 @@ typedef struct fcn_tree_iter_t {
 	RBNode *cur;
 	RBNode *path[R_RBTREE_MAX_HEIGHT];
 } FcnTreeIter;
-
-#if USE_SDB_CACHE
-static Sdb *HB = NULL;
-#endif
 
 R_API const char *r_anal_fcn_type_tostring(int type) {
 	switch (type) {
@@ -191,6 +186,8 @@ static void _fcn_tree_free(RBNode *node) {
 	// If the ownership transfers from fcns to fcn_tree:
 	//
 	// r_anal_fcn_free (FCN_CONTAINER (node));
+	RAnalFunction *fcn = FCN_CONTAINER (node);
+	r_anal_function_unref (fcn);
 }
 
 // Descent x_ to find the first node whose interval intersects [from, to)
@@ -227,11 +224,13 @@ R_API bool r_anal_fcn_tree_delete(RAnal *anal, RAnalFunction *fcn) {
 		eprintf ("WARNING: r_anal_fcn_tree_delete: check 'ret_min == ret_addr' failed\n");
 		return false;
 	}
+	r_anal_function_unref (fcn);
 	// r_return_val_if_fail (ret_min == ret_addr, false);
 	return ret_min;
 }
 
 R_API void r_anal_fcn_tree_insert(RAnal *anal, RAnalFunction *fcn) {
+	r_anal_function_ref (fcn);
 	r_rbtree_aug_insert (&anal->fcn_tree, fcn, &(fcn->rb), _fcn_tree_cmp, _fcn_tree_calc_max_addr, NULL);
 	r_rbtree_insert (&anal->fcn_addr_tree, fcn, &(fcn->addr_rb), _fcn_addr_tree_cmp, NULL);
 }
@@ -358,7 +357,7 @@ R_API int r_anal_fcn_resize(RAnal *anal, RAnalFunction *fcn, int newsize) {
 	r_list_foreach_safe (fcn->bbs, iter, iter2, bb) {
 		if (bb->addr >= eof) {
 			// already called by r_list_delete r_anal_bb_free (bb);
-			r_list_delete (fcn->bbs, iter);
+			// XXX ref/unref crash here r_list_delete (fcn->bbs, iter);
 			continue;
 		}
 		if (bb->addr + bb->size >= eof) {
@@ -380,18 +379,13 @@ R_API RAnalFunction *r_anal_fcn_new() {
 	if (!fcn) {
 		return NULL;
 	}
-	/* Function return type */
-	fcn->rets = 0;
-	fcn->_size = 0;
 	/* Function qualifier: static/volatile/inline/naked/virtual */
 	fcn->fmod = R_ANAL_FQUALIFIER_NONE;
 	/* Function calling convention: cdecl/stdcall/fastcall/etc */
-	fcn->cc = NULL;
 	/* Function attributes: weak/noreturn/format/etc */
 	fcn->addr = UT64_MAX;
-	fcn->fcn_locs = NULL;
+	fcn->ref = 1;
 	fcn->bbs = r_anal_bb_list_new ();
-	fcn->fingerprint = NULL;
 	fcn->diff = r_anal_diff_new ();
 	fcn->has_changed = true;
 	fcn->bp_frame = true;
@@ -442,17 +436,13 @@ static RAnalBlock *bbget(RAnalFunction *fcn, ut64 addr, bool jumpmid) {
 
 // TODO: split between bb.new and append_bb()
 static RAnalBlock *appendBasicBlock(RAnal *anal, RAnalFunction *fcn, ut64 addr) {
-	RAnalBlock *bb = r_anal_bb_new ();
+	r_return_val_if_fail (anal && fcn, NULL);
+	RAnalBlock *bb = r_anal_block_new (addr, 0);
 	if (bb) {
 		if (anal->verbose) {
 			eprintf ("Append bb at 0x%08"PFMT64x" (fcn 0x%08"PFMT64x ")\n", addr, fcn->addr);
 		}
-		bb->addr = addr;
-		bb->size = 0;
-		bb->jump = UT64_MAX;
-		bb->fail = UT64_MAX;
-		bb->type = 0; // TODO
-		r_anal_fcn_bbadd (fcn, bb);
+		r_anal_function_add_block (anal, fcn, bb);
 		if (anal->cb.on_fcn_bb_new) {
 			anal->cb.on_fcn_bb_new (anal, anal->user, fcn, bb);
 		}
@@ -1650,17 +1640,20 @@ R_API int r_anal_fcn_del_locs(RAnal *anal, ut64 addr) {
 			continue;
 		}
 		if (r_anal_fcn_in (fcn, addr)) {
+			// r_anal_function_unref (fcn);
 			if (!r_anal_fcn_tree_delete (anal, fcn)) {
 				return false;
 			}
 			r_list_delete (anal->fcns, iter);
 		}
 	}
-	r_anal_fcn_del (anal, addr);
 	return true;
 }
 
 R_API int r_anal_fcn_del(RAnal *a, ut64 addr) {
+	eprintf ("r_anal_fcn_del: deprecated. use ref/unref\n");
+	return false;
+#if 0
 	RAnalFunction *fcni;
 	RListIter *iter, *iter_tmp;
 	r_list_foreach_safe (a->fcns, iter, iter_tmp, fcni) {
@@ -1675,6 +1668,7 @@ R_API int r_anal_fcn_del(RAnal *a, ut64 addr) {
 		}
 	}
 	return true;
+#endif
 }
 
 R_API RList *r_anal_get_fcn_in_list(RAnal *anal, ut64 addr, int type) {
@@ -1716,6 +1710,16 @@ R_API RAnalFunction *r_anal_get_fcn_in(RAnal *anal, ut64 addr, int type) {
 	return ret;
 
 #else
+
+#define BBAPI 0
+#if BBAPI
+	// RAnalBlock *b = r_anal_get_block (anal, addr);
+	const RList *list = r_anal_get_functions (anal, addr);
+	if (list) {
+		return r_list_first (list);
+	}
+	return NULL;
+#else
 	// Interval tree query
 	RAnalFunction *fcn;
 	FcnTreeIter it;
@@ -1730,6 +1734,7 @@ R_API RAnalFunction *r_anal_get_fcn_in(RAnal *anal, ut64 addr, int type) {
 		}
 	}
 	return NULL;
+#endif
 #endif
 }
 
@@ -1815,7 +1820,7 @@ R_API bool r_anal_fcn_add_bb(RAnal *anal, RAnalFunction *fcn, ut64 addr, ut64 si
 		fcn_recurse (anal, fcn, addr, size, 1);
 		r_anal_fcn_update_tinyrange_bbs (fcn);
 		r_anal_fcn_set_size (anal, fcn, r_anal_fcn_size (fcn));
-		bb = r_anal_fcn_bbget_at (fcn, addr);
+		bb = r_anal_fcn_bbget_at (anal, fcn, addr);
 		if (!bb) {
 			if (fcn->addr == addr) {
 				return true;
@@ -2118,11 +2123,12 @@ R_API RAnalBlock *r_anal_fcn_bbget_in(const RAnal *anal, RAnalFunction *fcn, ut6
 	return NULL;
 }
 
-R_API RAnalBlock *r_anal_fcn_bbget_at(RAnalFunction *fcn, ut64 addr) {
+R_API RAnalBlock *r_anal_fcn_bbget_at(RAnal *anal, RAnalFunction *fcn, ut64 addr) {
 	r_return_val_if_fail (fcn && addr != UT64_MAX, NULL);
-#if USE_SDB_CACHE
-	return sdb_ptr_get (HB, sdb_fmt (SDB_KEY_BB, fcn->addr, addr), NULL);
-#else
+	RAnalBlock *b = r_anal_get_block (anal, addr);
+	if (b) {
+		return b;
+	}
 	RListIter *iter;
 	RAnalBlock *bb;
 	r_list_foreach (fcn->bbs, iter, bb) {
@@ -2131,18 +2137,7 @@ R_API RAnalBlock *r_anal_fcn_bbget_at(RAnalFunction *fcn, ut64 addr) {
 		}
 	}
 	return NULL;
-#endif
 }
-
-
-R_API bool r_anal_fcn_bbadd(RAnalFunction *fcn, RAnalBlock *bb) {
-#if USE_SDB_CACHE
-	return sdb_ptr_set (HB, sdb_fmt (SDB_KEY_BB, fcn->addr, bb->addr), bb, NULL);
-#endif
-	r_list_append (fcn->bbs, bb);
-	return true;
-}
-
 
 /* directly set the size of the function
  * if fcn is in ana RAnal's fcn_tree, the anal MUST be passed,
